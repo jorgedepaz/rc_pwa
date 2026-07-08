@@ -125,19 +125,75 @@ export class BleController {
       this.setStatus('unsupported');
       return;
     }
+    // Estado limpio: descarta cualquier referencia previa (p.ej. una obtenida de
+    // getDevices() que Bluefy no autoriza) antes de pedir una nueva del selector.
+    this.forgetDevice();
     const device = await navigator.bluetooth.requestDevice({
       filters: [{ services: [SERVICE_UUID] }, { name: DEVICE_NAME }],
       optionalServices: [SERVICE_UUID],
     });
     this.adoptDevice(device);
-    await this.connect();
+    this.wantConnected = true;
+    this.reconnectAttempts = 0;
+    // Bluefy/iOS a veces rechaza la conexion inmediata tras elegir en el
+    // selector (el ESP32 acaba de dejar de anunciarse): reintentamos 1-2 veces.
+    let lastErr: unknown;
+    for (let i = 0; i < 3; i++) {
+      try {
+        await this.ensureConnected();
+        return;
+      } catch (err) {
+        lastErr = err;
+        await BleController.delay(400);
+      }
+    }
+    throw lastErr;
   }
 
   private adoptDevice(device: BluetoothDevice) {
     if (this.device === device) return;
+    this.detachDevice();
     this.device = device;
     device.addEventListener('gattserverdisconnected', this.onDisconnected);
     this.emitRemembered();
+  }
+
+  /** Quita listeners del dispositivo actual sin cambiar el estado deseado. */
+  private detachDevice() {
+    if (this.device) {
+      this.device.removeEventListener('gattserverdisconnected', this.onDisconnected);
+    }
+  }
+
+  /** Olvida por completo el dispositivo recordado (obliga a re-emparejar). */
+  private forgetDevice() {
+    this.detachDevice();
+    this.device = null;
+    this.rxChar = null;
+    this.txChar = null;
+    this.wantConnected = false;
+    this.clearReconnectTimer();
+    this.emitRemembered();
+  }
+
+  private static delay(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /**
+   * True si el error indica que el navegador no autoriza este dispositivo para
+   * el origen (tipico de Bluefy al reusar un device de getDevices). En ese caso
+   * no tiene sentido reintentar: hay que volver a emparejar desde el selector.
+   */
+  private static isPermissionError(err: unknown): boolean {
+    const e = err as { name?: string; message?: string };
+    const name = e?.name ?? '';
+    const msg = e?.message ?? '';
+    return (
+      name === 'SecurityError' ||
+      name === 'NotAllowedError' ||
+      /was not offered to this origin/i.test(msg)
+    );
   }
 
   // ------------------------------------------------------------------ conectar
@@ -146,7 +202,16 @@ export class BleController {
     if (!this.device) throw new Error('No hay dispositivo recordado. Empareja primero.');
     this.wantConnected = true;
     this.reconnectAttempts = 0;
-    await this.ensureConnected();
+    try {
+      await this.ensureConnected();
+    } catch (err) {
+      if (BleController.isPermissionError(err)) {
+        // Dispositivo recordado ya no autorizado por el navegador: olvidarlo
+        // para que la UI muestre "Emparejar" y el usuario pase por el selector.
+        this.forgetDevice();
+      }
+      throw err;
+    }
   }
 
   /**
@@ -265,7 +330,14 @@ export class BleController {
     if (!this.wantConnected) return;
     try {
       await this.ensureConnected();
-    } catch {
+    } catch (err) {
+      if (BleController.isPermissionError(err)) {
+        // El navegador ya no autoriza este dispositivo: detener el bucle y
+        // pedir re-emparejar (no se puede abrir el selector sin gesto del usuario).
+        this.forgetDevice();
+        this.setStatus('disconnected', 'Vuelve a emparejar el tablero.');
+        return;
+      }
       this.scheduleReconnect();
     }
   }
