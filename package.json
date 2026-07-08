@@ -1,0 +1,18 @@
+{
+  "name": "rc-pwa-tablero",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "PWA control remoto BLE para tablero marcador de futbol (ESP32 / Nordic UART Service)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2",
+    "vite-plugin-pwa": "^0.20.5",
+    "@types/web-bluetooth": "^0.0.20"
+  }
+}
