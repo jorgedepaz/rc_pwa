@@ -90,12 +90,20 @@ export function mountUI(root: HTMLElement, ble: BleController): void {
     try {
       await ble.send(key.cmd);
     } catch (err) {
-      showAck(`Error: ${(err as Error).message}`);
+      showAck(`Error: ${errMsg(err)}`);
     }
   }
 
   function showAck(msg: string) {
     ackEl.textContent = msg;
+  }
+
+  // Extrae un texto legible de cualquier error (algunos polyfills de iOS
+  // lanzan objetos sin .message, o incluso strings/undefined).
+  function errMsg(err: unknown): string {
+    if (err == null) return 'error desconocido';
+    const e = err as { message?: string; name?: string };
+    return e.message || e.name || String(err);
   }
 
   // ---- Reflejar estado de conexion en la UI ----
@@ -119,7 +127,7 @@ export function mountUI(root: HTMLElement, ble: BleController): void {
     try {
       await ble.pair();
     } catch (err) {
-      showAck(`No se pudo emparejar: ${(err as Error).message}`);
+      showAck(`No se pudo emparejar: ${errMsg(err)}`);
     }
   });
 
@@ -127,7 +135,7 @@ export function mountUI(root: HTMLElement, ble: BleController): void {
     try {
       await ble.connect();
     } catch (err) {
-      showAck(`No se pudo conectar: ${(err as Error).message}`);
+      showAck(`No se pudo conectar: ${errMsg(err)}`);
     }
   });
 

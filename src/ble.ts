@@ -38,6 +38,9 @@ export class BleController {
   // --- control de reconexion ---
   private wantConnected = false; // estado deseado por el usuario
   private connecting = false; // candado single-flight (evita conexiones solapadas)
+  // true si el dispositivo se obtuvo del selector (requestDevice); false si vino
+  // de getDevices() (memoria). En iOS los de memoria no siempre se pueden conectar.
+  private deviceFromPicker = false;
   private reconnectAttempts = 0;
   private reconnectTimer: number | null = null;
 
@@ -110,7 +113,10 @@ export class BleController {
       const match =
         devices.find((d) => d.name === DEVICE_NAME) ??
         (devices.length === 1 ? devices[0] : undefined);
-      if (match) this.adoptDevice(match);
+      if (match) {
+        this.adoptDevice(match);
+        this.deviceFromPicker = false; // vino de memoria: no siempre conectable en iOS
+      }
     } catch {
       // getDevices puede fallar en algunos navegadores; se ignora.
     }
@@ -128,11 +134,15 @@ export class BleController {
     // Estado limpio: descarta cualquier referencia previa (p.ej. una obtenida de
     // getDevices() que Bluefy no autoriza) antes de pedir una nueva del selector.
     this.forgetDevice();
+    // Un solo filtro por nombre + el servicio en optionalServices: es la forma
+    // mas compatible (Chrome, Bluefy, WebBLE). Un filtro con varias entradas
+    // confunde a los polyfills de iOS y provoca "not offered to this origin".
     const device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [SERVICE_UUID] }, { name: DEVICE_NAME }],
+      filters: [{ namePrefix: 'Tablero' }],
       optionalServices: [SERVICE_UUID],
     });
     this.adoptDevice(device);
+    this.deviceFromPicker = true;
     this.wantConnected = true;
     this.reconnectAttempts = 0;
     // Bluefy/iOS a veces rechaza la conexion inmediata tras elegir en el
@@ -144,9 +154,11 @@ export class BleController {
         return;
       } catch (err) {
         lastErr = err;
+        if (BleController.isPermissionError(err)) break; // no es transitorio
         await BleController.delay(400);
       }
     }
+    this.forgetDevice(); // deja la UI lista para reintentar con "Emparejar"
     throw lastErr;
   }
 
@@ -169,6 +181,7 @@ export class BleController {
   private forgetDevice() {
     this.detachDevice();
     this.device = null;
+    this.deviceFromPicker = false;
     this.rxChar = null;
     this.txChar = null;
     this.wantConnected = false;
@@ -205,13 +218,19 @@ export class BleController {
     try {
       await this.ensureConnected();
     } catch (err) {
-      if (BleController.isPermissionError(err)) {
-        // Dispositivo recordado ya no autorizado por el navegador: olvidarlo
-        // para que la UI muestre "Emparejar" y el usuario pase por el selector.
-        this.forgetDevice();
-      }
+      if (this.shouldForget(err)) this.forgetDevice();
       throw err;
     }
+  }
+
+  /**
+   * Decide si conviene olvidar el dispositivo tras un fallo de conexion:
+   *   - error de permiso (el navegador ya no lo autoriza), o
+   *   - vino de getDevices() (memoria) y en iOS esos no siempre se conectan.
+   * En ambos casos hay que volver al selector con "Emparejar".
+   */
+  private shouldForget(err: unknown): boolean {
+    return BleController.isPermissionError(err) || !this.deviceFromPicker;
   }
 
   /**
@@ -331,9 +350,9 @@ export class BleController {
     try {
       await this.ensureConnected();
     } catch (err) {
-      if (BleController.isPermissionError(err)) {
-        // El navegador ya no autoriza este dispositivo: detener el bucle y
-        // pedir re-emparejar (no se puede abrir el selector sin gesto del usuario).
+      if (this.shouldForget(err)) {
+        // El navegador no autoriza este dispositivo (o vino de memoria en iOS):
+        // detener el bucle y pedir re-emparejar (el selector requiere un gesto).
         this.forgetDevice();
         this.setStatus('disconnected', 'Vuelve a emparejar el tablero.');
         return;
