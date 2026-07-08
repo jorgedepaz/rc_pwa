@@ -13,18 +13,20 @@ interface Key {
   variant?: 'num' | 'sym' | 'letter';
 }
 
+// Disposicion en rejilla de 3 columnas (se llena fila por fila):
+//   col1: 1 4 7 *   |   col2: 3 6 9 #   |   col3: A B C D
 const KEYS: Key[] = [
   { label: '1', cmd: 'BTN_1', variant: 'num' },
   { label: '3', cmd: 'BTN_3', variant: 'num' },
+  { label: 'A', cmd: 'BTN_LA', variant: 'letter' },
   { label: '4', cmd: 'BTN_4', variant: 'num' },
   { label: '6', cmd: 'BTN_6', variant: 'num' },
+  { label: 'B', cmd: 'BTN_LB', variant: 'letter' },
   { label: '7', cmd: 'BTN_7', variant: 'num' },
   { label: '9', cmd: 'BTN_9', variant: 'num' },
-  { label: '#', cmd: 'BTN_HASH', variant: 'sym' },
-  { label: '*', cmd: 'BTN_STAR', variant: 'sym' },
-  { label: 'A', cmd: 'BTN_LA', variant: 'letter' },
-  { label: 'B', cmd: 'BTN_LB', variant: 'letter' },
   { label: 'C', cmd: 'BTN_LC', variant: 'letter' },
+  { label: '*', cmd: 'BTN_STAR', variant: 'sym' },
+  { label: '#', cmd: 'BTN_HASH', variant: 'sym' },
   { label: 'D', cmd: 'BTN_LD', variant: 'letter' },
 ];
 
@@ -51,13 +53,6 @@ export function mountUI(root: HTMLElement, ble: BleController): void {
         </div>
       </header>
 
-      <div id="ios-banner" class="banner" hidden>
-        <strong>Este navegador no soporta Bluetooth Web.</strong>
-        <span>En iPhone/iPad abre esta página con la app
-          <a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055"
-             target="_blank" rel="noopener">Bluefy</a> para poder controlar el tablero.</span>
-      </div>
-
       <main class="keypad" id="keypad"></main>
 
       <footer class="footer">
@@ -71,7 +66,6 @@ export function mountUI(root: HTMLElement, ble: BleController): void {
   const btnPair = root.querySelector<HTMLButtonElement>('#btn-pair')!;
   const btnConnect = root.querySelector<HTMLButtonElement>('#btn-connect')!;
   const btnDisconnect = root.querySelector<HTMLButtonElement>('#btn-disconnect')!;
-  const iosBanner = root.querySelector<HTMLDivElement>('#ios-banner')!;
   const keypad = root.querySelector<HTMLElement>('#keypad')!;
   const ackEl = root.querySelector<HTMLSpanElement>('#ack')!;
 
@@ -110,14 +104,12 @@ export function mountUI(root: HTMLElement, ble: BleController): void {
     statusDot.dataset.state = status;
 
     const connected = status === 'connected';
-    const unsupported = status === 'unsupported';
     const hasRemembered = ble.hasRememberedDevice();
 
     for (const b of keyButtons) b.disabled = !connected;
 
-    iosBanner.hidden = !unsupported;
-    btnPair.hidden = unsupported || connected || hasRemembered;
-    btnConnect.hidden = unsupported || connected || !hasRemembered;
+    btnPair.hidden = connected || hasRemembered;
+    btnConnect.hidden = connected || !hasRemembered;
     btnConnect.disabled = status === 'connecting';
     btnDisconnect.hidden = !connected;
   }

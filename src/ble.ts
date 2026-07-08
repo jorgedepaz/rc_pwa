@@ -5,10 +5,12 @@
  *   - Escribe comandos de texto (BTN_1, BTN_HASH, ...) en la caracteristica RX.
  *   - Recibe ACKs por notificacion en la caracteristica TX.
  *
- * Responsabilidades clave:
- *   - Emparejamiento unico (requestDevice) + memoria de dispositivo (getDevices).
- *   - Reconexion automatica ante desconexion o al desbloquear la pantalla.
- *   - Emitir eventos de estado para que la UI se mantenga sincronizada.
+ * Reconexion robusta:
+ *   - `wantConnected` = estado deseado (queremos estar conectados).
+ *   - `connecting`    = candado "single-flight": nunca hay dos gatt.connect()
+ *                       simultaneos (esa era la causa del bucle de reconexion).
+ *   - Un solo temporizador de backoff. gattserverdisconnected y visibilitychange
+ *     solo *piden* reconectar; ensureConnected() decide y serializa.
  */
 
 // ---- UUIDs Nordic UART Service (NUS) -- deben coincidir con el firmware ----
@@ -32,9 +34,12 @@ export class BleController {
   private txChar: BluetoothRemoteGATTCharacteristic | null = null;
 
   private status: BleStatus = 'idle';
+
+  // --- control de reconexion ---
+  private wantConnected = false; // estado deseado por el usuario
+  private connecting = false; // candado single-flight (evita conexiones solapadas)
   private reconnectAttempts = 0;
   private reconnectTimer: number | null = null;
-  private manualDisconnect = false;
 
   private listeners: { [K in keyof BleEvents]: Set<BleEvents[K]> } = {
     status: new Set(),
@@ -80,10 +85,11 @@ export class BleController {
     return this.device != null;
   }
   isConnected(): boolean {
-    return this.status === 'connected';
+    return this.status === 'connected' && this.device?.gatt?.connected === true;
   }
 
   private setStatus(status: BleStatus, detail?: string) {
+    if (this.status === status && !detail) return;
     this.status = status;
     this.emitStatus(detail);
   }
@@ -102,18 +108,17 @@ export class BleController {
     try {
       const devices = await bt.getDevices();
       const match =
-        devices.find((d) => d.name === DEVICE_NAME) ?? (devices.length === 1 ? devices[0] : undefined);
-      if (match) {
-        this.adoptDevice(match);
-      }
+        devices.find((d) => d.name === DEVICE_NAME) ??
+        (devices.length === 1 ? devices[0] : undefined);
+      if (match) this.adoptDevice(match);
     } catch {
-      // getDevices puede fallar en algunos navegadores; se ignora silenciosamente.
+      // getDevices puede fallar en algunos navegadores; se ignora.
     }
   }
 
   /**
-   * Emparejamiento unico: muestra el selector del sistema. Solo se necesita
-   * la primera vez; despues restore() + connect() bastan.
+   * Emparejamiento unico: muestra el selector del sistema. Solo la primera vez;
+   * despues restore() + connect() bastan.
    */
   async pair(): Promise<void> {
     if (!BleController.isSupported()) {
@@ -136,31 +141,61 @@ export class BleController {
   }
 
   // ------------------------------------------------------------------ conectar
+  /** Solicita conectar (y mantenerse conectado). */
   async connect(): Promise<void> {
     if (!this.device) throw new Error('No hay dispositivo recordado. Empareja primero.');
-    if (this.status === 'connected' && this.device.gatt?.connected) return;
-
-    this.manualDisconnect = false;
-    this.setStatus('connecting');
-
-    const gatt = this.device.gatt;
-    if (!gatt) throw new Error('El dispositivo no expone GATT.');
-
-    const server = await gatt.connect();
-    const service = await server.getPrimaryService(SERVICE_UUID);
-    this.rxChar = await service.getCharacteristic(RX_UUID);
-    this.txChar = await service.getCharacteristic(TX_UUID);
-
-    await this.txChar.startNotifications();
-    this.txChar.addEventListener('characteristicvaluechanged', this.onNotify);
-
+    this.wantConnected = true;
     this.reconnectAttempts = 0;
-    this.setStatus('connected');
+    await this.ensureConnected();
   }
 
-  /** Desconexion voluntaria (no dispara reconexion automatica). */
+  /**
+   * Nucleo de conexion serializada. El candado `connecting` garantiza que
+   * jamas haya dos intentos de conexion en paralelo (la causa del bucle).
+   */
+  private async ensureConnected(): Promise<void> {
+    if (this.connecting) return; // ya hay un intento en curso
+    if (this.isConnected()) return;
+    if (!this.device?.gatt) return;
+
+    this.connecting = true;
+    this.clearReconnectTimer();
+    this.setStatus('connecting');
+    try {
+      const gatt = this.device.gatt;
+      if (!gatt.connected) await gatt.connect();
+
+      const service = await gatt.getPrimaryService(SERVICE_UUID);
+      this.rxChar = await service.getCharacteristic(RX_UUID);
+      this.txChar = await service.getCharacteristic(TX_UUID);
+
+      await this.txChar.startNotifications();
+      this.txChar.removeEventListener('characteristicvaluechanged', this.onNotify);
+      this.txChar.addEventListener('characteristicvaluechanged', this.onNotify);
+
+      this.reconnectAttempts = 0;
+      this.setStatus('connected');
+    } catch (err) {
+      this.rxChar = null;
+      this.txChar = null;
+      // Deja el GATT en estado limpio para el proximo intento.
+      if (this.device?.gatt?.connected) {
+        try {
+          this.device.gatt.disconnect();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.setStatus('disconnected');
+      throw err;
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  /** Desconexion voluntaria (detiene la reconexion automatica). */
   disconnect(): void {
-    this.manualDisconnect = true;
+    this.wantConnected = false;
     this.clearReconnectTimer();
     if (this.device?.gatt?.connected) {
       this.device.gatt.disconnect();
@@ -176,7 +211,6 @@ export class BleController {
       throw new Error('Sin conexion con el tablero.');
     }
     const data = this.encoder.encode(cmd);
-    // Write-no-response = minima latencia; el firmware soporta WRITE_NR.
     if (this.rxChar.properties.writeWithoutResponse) {
       await this.rxChar.writeValueWithoutResponse(data);
     } else {
@@ -196,19 +230,17 @@ export class BleController {
     this.rxChar = null;
     this.txChar = null;
     this.setStatus('disconnected');
-    if (!this.manualDisconnect) {
-      this.scheduleReconnect();
-    }
+    if (this.wantConnected) this.scheduleReconnect();
   };
 
   private onVisibilityChange = () => {
     if (
       document.visibilityState === 'visible' &&
-      !this.manualDisconnect &&
-      this.device != null &&
+      this.wantConnected &&
+      !this.connecting &&
       !this.isConnected()
     ) {
-      // Reconexion inmediata al volver a primer plano.
+      // Reintento inmediato al volver a primer plano (reinicia el backoff).
       this.reconnectAttempts = 0;
       this.clearReconnectTimer();
       void this.tryReconnect();
@@ -217,20 +249,23 @@ export class BleController {
 
   // --------------------------------------------------------- reconexion (auto)
   private scheduleReconnect() {
-    if (this.manualDisconnect || !this.device) return;
-    this.clearReconnectTimer();
-    // Backoff acotado: 250, 500, 1000, 2000, ... hasta 5 s.
-    const delay = Math.min(250 * 2 ** this.reconnectAttempts, 5000);
+    if (!this.wantConnected || !this.device) return;
+    if (this.connecting || this.reconnectTimer != null) return; // ya hay algo en marcha
+    // Backoff acotado: 500ms, 1s, 2s, 4s, hasta 8s. El ESP32 necesita ~500ms
+    // para re-anunciar tras una desconexion (ver su loop()).
+    const delay = Math.min(500 * 2 ** this.reconnectAttempts, 8000);
     this.reconnectAttempts++;
-    this.reconnectTimer = window.setTimeout(() => void this.tryReconnect(), delay);
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.tryReconnect();
+    }, delay);
   }
 
   private async tryReconnect() {
-    if (this.manualDisconnect || !this.device) return;
+    if (!this.wantConnected) return;
     try {
-      await this.connect();
+      await this.ensureConnected();
     } catch {
-      // El ESP32 re-anuncia tras desconectar; reintentamos con backoff.
       this.scheduleReconnect();
     }
   }
